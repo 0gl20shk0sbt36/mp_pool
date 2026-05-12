@@ -92,6 +92,7 @@ typedef struct {
     uint8_t  delayed;        /* 1 = lazy allocation (pages not yet assigned) */
     uint8_t  full_locked;    /* mp_lock reference count (0 = none) */
     uint16_t parent_handle;  /* 0xFFFF = root, else index of parent handle */
+    uint16_t page_offset;    /* intra-page byte offset (child handle only) */
     uint8_t  child_type;     /* (child only) 0=read-only, 1=writable */
     uint8_t  child_refs;     /* (root only) number of active child handles */
     uint8_t  child_wr_refs;  /* (root only) number of writable children */

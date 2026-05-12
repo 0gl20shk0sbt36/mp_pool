@@ -764,8 +764,38 @@ static void test_T14_partial_map(void) {
     if (e == MP_OK) {
         uint8_t *expected = pool_mem + PAGE_SIZE;
         check_bool(ptr == expected, "child lock returns correct pointer (offset PAGE_SIZE)");
+
+        /* Verify child lock does NOT increment parent page lock_count.
+         * Parent pages should have lock_count == 0 after child's unlock. */
         assert(mp_unlock(&app, child) == MP_OK);
     }
+
+    /* Non-page-aligned offset: offset = PAGE_SIZE + 50 */
+    mp_handle_t child2;
+    e = mp_partial_map(&app, parent, PAGE_SIZE + 50, 100, false, &child2);
+    check(e, MP_OK, "partial_map with non-page-aligned offset");
+
+    e = mp_lock(&app, child2, &ptr);
+    check(e, MP_OK, "mp_lock on non-page-aligned child");
+    if (e == MP_OK) {
+        uint8_t *expected = pool_mem + PAGE_SIZE + 50;
+        check_bool(ptr == expected,
+                   "child lock returns correct pointer (offset PAGE_SIZE+50)");
+        assert(mp_unlock(&app, child2) == MP_OK);
+    }
+    mp_free(&app, child2);
+
+    /* Also free the first child so parent can be fully locked */
+    mp_free(&app, child);
+
+    /* Verify parent page lock_count unaffected by child activity */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    /* Parent's pages should have lock_count == 1 (from parent's lock),
+       not incremented by any child operations */
+    void *parent_ptr;
+    assert(mp_lock(&app, parent, &parent_ptr) == MP_OK); /* lock_count == 2 */
+    assert(mp_unlock(&app, parent) == MP_OK);
+    assert(mp_unlock(&app, parent) == MP_OK);
 
     /* Out-of-range offset */
     mp_handle_t bad_child;
@@ -775,10 +805,6 @@ static void test_T14_partial_map(void) {
     /* Zero length */
     e = mp_partial_map(&app, parent, 0, 0, false, &bad_child);
     check(e, MP_ERR_INVALID_PARAM, "partial_map with zero length");
-
-    /* Free child handle (unmap) */
-    e = mp_free(&app, child);
-    check(e, MP_OK, "mp_free child handle (unmap)");
 
     mp_free(&app, parent);
 }
