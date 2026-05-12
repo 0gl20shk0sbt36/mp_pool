@@ -1,0 +1,6 @@
+# Build artifacts
+*.o
+test_mp_pool
+
+# Agent working files
+.agents_tmp/
