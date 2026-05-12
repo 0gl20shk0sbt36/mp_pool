@@ -734,7 +734,7 @@ static void test_T13_vm_swap(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- *  T14: VM mode mp_lock_partial
+ *  T14: mp_partial_map (read-only child handle)
  * ═══════════════════════════════════════════════════════════════ */
 static void test_T14_partial_map(void) {
     printf("\nT14: mp_partial_map (read-only child handle)\n");
@@ -752,35 +752,54 @@ static void test_T14_partial_map(void) {
     mp_handle_t parent;
     assert(mp_alloc_pages(&app, 4, &parent) == MP_OK);
 
+    /* Lock parent and write initial data */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    memset(pool_mem, 0xAA, PAGE_SIZE * 4);
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* Create child (independent pages — reads are zero, writes don't touch parent) */
     mp_handle_t child;
     mp_error_t e = mp_partial_map(&app, parent, PAGE_SIZE, PAGE_SIZE * 2, false, &child);
     check(e, MP_OK, "mp_partial_map read-only child");
 
-    /* Lock child handle */
     void *ptr;
     e = mp_lock(&app, child, &ptr);
     check(e, MP_OK, "mp_lock on child handle");
-
     if (e == MP_OK) {
-        uint8_t *expected = pool_mem + PAGE_SIZE;
-        check_bool(ptr == expected, "child lock returns correct pointer (offset PAGE_SIZE)");
+        /* Child has its own pages (zero-initialized, not parent's data) */
+        check_bool(*(uint8_t*)ptr == 0x00,
+                   "child pages are zero-initialized (independent alloc)");
 
-        /* Verify child lock does NOT increment parent page lock_count.
-         * Parent pages should have lock_count == 0 after child's unlock. */
+        /* Verify child pointer is page-aligned (offset=PAGE_SIZE, page_offset=0) */
+        size_t off = (uint8_t*)ptr - (uint8_t*)pool_mem;
+        check_bool(off % PAGE_SIZE == 0,
+                   "child lock returns page-aligned ptr (page_offset=0)");
+
+        /* Write through child — verify parent unaffected */
+        memset(ptr, 0xCD, PAGE_SIZE * 2);
         assert(mp_unlock(&app, child) == MP_OK);
+
+        /* Free child so parent can be locked */
+        mp_free(&app, child);
+
+        assert(mp_lock(&app, parent, NULL) == MP_OK);
+        check_bool(*(uint8_t*)(pool_mem + PAGE_SIZE) == 0xAA,
+                   "parent page 1 unchanged after child write");
+        assert(mp_unlock(&app, parent) == MP_OK);
     }
 
     /* Non-page-aligned offset: offset = PAGE_SIZE + 50 */
     mp_handle_t child2;
     e = mp_partial_map(&app, parent, PAGE_SIZE + 50, 100, false, &child2);
     check(e, MP_OK, "partial_map with non-page-aligned offset");
-
     e = mp_lock(&app, child2, &ptr);
     check(e, MP_OK, "mp_lock on non-page-aligned child");
     if (e == MP_OK) {
-        uint8_t *expected = pool_mem + PAGE_SIZE + 50;
-        check_bool(ptr == expected,
-                   "child lock returns correct pointer (offset PAGE_SIZE+50)");
+        /* ptr = child_page_base + (50 % PAGE_SIZE) = child_page_base + 50 */
+        /* Verify the base is page-aligned */
+        size_t offset_in_pool = (uint8_t*)ptr - (uint8_t*)pool_mem;
+        check_bool((offset_in_pool % PAGE_SIZE) == 50,
+                   "child lock returns ptr at page_offset=50");
         assert(mp_unlock(&app, child2) == MP_OK);
     }
     mp_free(&app, child2);
@@ -835,23 +854,31 @@ static void test_T35_child_compact_unlocked(void) {
     memset(pool_mem + PAGE_SIZE, 0xBB, PAGE_SIZE);
     assert(mp_unlock(&app, parent) == MP_OK);
 
-    /* Create two children but DON'T lock them */
+    /* Create two children with independent pages */
     mp_handle_t c1, c2;
     assert(mp_partial_map(&app, parent, 0, PAGE_SIZE, false, &c1) == MP_OK);
     assert(mp_partial_map(&app, parent, PAGE_SIZE, PAGE_SIZE, false, &c2) == MP_OK);
+
+    /* Write data through the children */
+    void *ptr;
+    assert(mp_lock(&app, c1, &ptr) == MP_OK);
+    memset(ptr, 0x11, PAGE_SIZE);
+    assert(mp_unlock(&app, c1) == MP_OK);
+    assert(mp_lock(&app, c2, &ptr) == MP_OK);
+    memset(ptr, 0x22, PAGE_SIZE);
+    assert(mp_unlock(&app, c2) == MP_OK);
 
     /* child_refs > 0, but child_full_locked == 0 → compaction allowed */
     mp_error_t e = mp_compact(&app);
     check(e, MP_OK, "compact returns OK");
 
-    /* Verify data via child lock (parent can't be locked while children exist) */
-    void *ptr;
+    /* Verify data via child lock (children have their own pages) */
     assert(mp_lock(&app, c1, &ptr) == MP_OK);
-    check_bool(*(uint8_t*)ptr == 0xAA, "child1 data intact after compact");
+    check_bool(*(uint8_t*)ptr == 0x11, "child1 data intact after compact");
     assert(mp_unlock(&app, c1) == MP_OK);
 
     assert(mp_lock(&app, c2, &ptr) == MP_OK);
-    check_bool(*(uint8_t*)ptr == 0xBB, "child2 data intact after compact");
+    check_bool(*(uint8_t*)ptr == 0x22, "child2 data intact after compact");
     assert(mp_unlock(&app, c2) == MP_OK);
 
     /* Cleanup */
