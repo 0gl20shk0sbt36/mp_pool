@@ -810,6 +810,57 @@ static void test_T14_partial_map(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ *  T35: unlocked children do not block compaction
+ * ═══════════════════════════════════════════════════════════════ */
+static void test_T35_child_compact_unlocked(void) {
+    printf("\nT35: unlocked children do not block compaction\n");
+    reset_pool();
+    mp_config_t cfg = { .pool_memory = pool_mem, .pool_size = POOL_SIZE,
+        .metadata = meta_data, .metadata_size = METADATA_SZ,
+        .page_size = PAGE_SIZE, .max_handles = MAX_HANDLES };
+    mp_pool_t pool = {0};
+    assert(mp_init(&pool, &cfg) == MP_OK);
+    mp_applicant_t app = { .pool = &pool, .applicant_id = 1 };
+
+    /* Alloc parent (2 pages, PPN 0-1) + gap (free PPN 2-3) + children on parent */
+    mp_handle_t parent;
+    assert(mp_alloc_pages(&app, 2, &parent) == MP_OK); /* PPN 0-1 */
+    mp_handle_t gap;
+    assert(mp_alloc_pages(&app, 2, &gap) == MP_OK);    /* PPN 2-3 */
+    assert(mp_free(&app, gap) == MP_OK);                /* free gap */
+
+    /* Write data to parent pages BEFORE creating children */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    memset(pool_mem, 0xAA, PAGE_SIZE);
+    memset(pool_mem + PAGE_SIZE, 0xBB, PAGE_SIZE);
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* Create two children but DON'T lock them */
+    mp_handle_t c1, c2;
+    assert(mp_partial_map(&app, parent, 0, PAGE_SIZE, false, &c1) == MP_OK);
+    assert(mp_partial_map(&app, parent, PAGE_SIZE, PAGE_SIZE, false, &c2) == MP_OK);
+
+    /* child_refs > 0, but child_full_locked == 0 → compaction allowed */
+    mp_error_t e = mp_compact(&app);
+    check(e, MP_OK, "compact returns OK");
+
+    /* Verify data via child lock (parent can't be locked while children exist) */
+    void *ptr;
+    assert(mp_lock(&app, c1, &ptr) == MP_OK);
+    check_bool(*(uint8_t*)ptr == 0xAA, "child1 data intact after compact");
+    assert(mp_unlock(&app, c1) == MP_OK);
+
+    assert(mp_lock(&app, c2, &ptr) == MP_OK);
+    check_bool(*(uint8_t*)ptr == 0xBB, "child2 data intact after compact");
+    assert(mp_unlock(&app, c2) == MP_OK);
+
+    /* Cleanup */
+    mp_free(&app, c1);
+    mp_free(&app, c2);
+    mp_free(&app, parent);
+}
+
+/* ═══════════════════════════════════════════════════════════════
  *  T23: mp_resize_pages — shrink
  * ═══════════════════════════════════════════════════════════════ */
 static void test_T23_resize_shrink(void) {
@@ -1320,6 +1371,7 @@ int main(void) {
     test_T32_applicant_free_all();
     test_T33_applicant_free_force();
     test_T34_partial_map_mutex();
+    test_T35_child_compact_unlocked();
 
     printf("\n=== Results: %d passed, %d failed (out of %d) ===\n",
            test_passed, test_failed, test_idx);

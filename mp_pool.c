@@ -267,8 +267,9 @@ static mp_handle_entry_t *validate_handle(const mp_pool_t *pool,
 static bool handle_all_pages_unlocked(const mp_pool_t *pool, uint16_t hidx) {
     mp_handle_entry_t *ht = handle_tbl(pool);
 
-    /* Handle with active children cannot be evicted */
-    if (ht[hidx].child_refs > 0) return false;
+    /* Handle with active children cannot be evicted.
+     * Also handle with locked children cannot be evicted. */
+    if (ht[hidx].child_refs > 0 || ht[hidx].child_full_locked > 0) return false;
 
     uint16_t vpn   = ht[hidx].start_vpn;
     uint16_t count = ht[hidx].page_count;
@@ -582,6 +583,7 @@ mp_error_t mp_alloc_pages_fn(mp_applicant_t *app, uint16_t num_pages, mp_handle_
         ht[hidx].child_type    = 0;
         ht[hidx].child_refs    = 0;
         ht[hidx].child_wr_refs = 0;
+        ht[hidx].child_full_locked = 0;
 
         if (!pool->delayed_no_reserve)
             mh->reserved_pages += num_pages;
@@ -737,6 +739,7 @@ mp_error_t mp_alloc_pages_fn(mp_applicant_t *app, uint16_t num_pages, mp_handle_
     ht[hidx].child_type    = 0;
     ht[hidx].child_refs    = 0;
     ht[hidx].child_wr_refs = 0;
+    ht[hidx].child_full_locked = 0;
 
     /* Add to LRU head if VM enabled */
     if (pool->vm_enabled)
@@ -807,47 +810,68 @@ mp_error_t mp_lock_fn(mp_applicant_t *app, mp_handle_t handle, void **out_ptr, c
     if (entry->full_locked >= MP_FULL_LOCK_MAX)
         return MP_ERR_WR_LOCKED;
 
-    /* ── Child handle fast-path: no page iteration, no lock_count ── */
+    /* ── Child handle fast-path: load pages but no lock_count increment ── */
     if (entry->parent_handle != 0xFFFF) {
-        uint16_t *v2p = vpn2ppn_tbl(pool);
-        uint16_t first_ppn = v2p[entry->start_vpn];
-        if (first_ppn == MP_PPN_INVALID && pool->vm_enabled) {
-            /* Load first page from swap */
-            mp_free_block_node_t *fn = free_node_arr(pool);
-            uint16_t fcur = mh->free_list_head;
-            bool loaded = false;
-            while (fcur != 0xFFFF) {
-                if (fn[fcur].size > 0) {
-                    uint16_t load_ppn = fn[fcur].start_ppn;
-                    fn[fcur].start_ppn++;
-                    fn[fcur].size--;
-                    if (fn[fcur].size == 0) {
-                        uint16_t p = fb_find_prev(pool, mh->free_list_head, fcur);
-                        fb_list_remove(pool, p, fcur);
+        uint16_t vpn   = entry->start_vpn;
+        uint16_t count = entry->page_count;
+        uint16_t *v2p  = vpn2ppn_tbl(pool);
+        uint16_t first_ppn = 0xFFFF;
+
+        for (uint16_t i = 0; i < count; i++) {
+            uint16_t ppn = v2p[vpn + i];
+
+            /* VM: load if swapped out */
+            if (ppn == MP_PPN_INVALID && pool->vm_enabled) {
+                mp_free_block_node_t *fn = free_node_arr(pool);
+                uint16_t fcur = mh->free_list_head;
+                bool loaded = false;
+
+                while (fcur != 0xFFFF) {
+                    if (fn[fcur].size > 0) {
+                        uint16_t load_ppn = fn[fcur].start_ppn;
+                        fn[fcur].start_ppn++;
+                        fn[fcur].size--;
+                        if (fn[fcur].size == 0) {
+                            uint16_t p = fb_find_prev(pool, mh->free_list_head, fcur);
+                            fb_list_remove(pool, p, fcur);
+                            fb_free_node(pool, fcur);
+                        }
+                        if (pool->vm_load)
+                            pool->vm_load(pool->vm_user_data, (uint16_t)(vpn + i),
+                                          1, (uint8_t *)pool->pool_memory + (size_t)load_ppn * pool->page_size,
+                                          pool->page_size);
+                        v2p[vpn + i] = load_ppn;
+                        ppn2vpn_tbl(pool)[load_ppn] = (uint16_t)(vpn + i);
+                        page_desc_tbl(pool)[load_ppn].flags        = 1;
+                        page_desc_tbl(pool)[load_ppn].lock_count   = 0;
+                        page_desc_tbl(pool)[load_ppn].owner_handle = handle.index;
+                        ppn = load_ppn;
+                        loaded = true;
+                        break;
                     }
-                    if (pool->vm_load)
-                        pool->vm_load(pool->vm_user_data, entry->start_vpn, 1,
-                                      (uint8_t *)pool->pool_memory + (size_t)load_ppn * pool->page_size,
-                                      pool->page_size);
-                    page_desc_tbl(pool)[load_ppn].flags        = 1;
-                    page_desc_tbl(pool)[load_ppn].lock_count   = 0;
-                    page_desc_tbl(pool)[load_ppn].owner_handle = handle.index;
-                    v2p[entry->start_vpn] = load_ppn;
-                    ppn2vpn_tbl(pool)[load_ppn] = entry->start_vpn;
-                    first_ppn = load_ppn;
-                    loaded = true;
-                    break;
+                    fcur = fn[fcur].next;
                 }
-                fcur = fn[fcur].next;
+                if (!loaded) {
+                    mp_oom_notify(pool, MP_ERR_NO_MEMORY, file, line);
+                    return MP_ERR_NO_MEMORY;
+                }
+            } else if (ppn == MP_PPN_INVALID) {
+                return MP_ERR_INVALID_POOL;
             }
-            if (!loaded) return MP_ERR_NO_MEMORY;
-        } else if (first_ppn == MP_PPN_INVALID) {
-            return MP_ERR_INVALID_POOL;
+
+            /* No lock_count increment for child handles */
+            if (i == 0) first_ppn = ppn;
         }
+
         if (out_ptr)
             *out_ptr = (uint8_t *)pool->pool_memory + (size_t)first_ppn * pool->page_size
                        + entry->page_offset;
         entry->full_locked++;
+
+        /* Track on parent for compaction/eviction checks */
+        mp_handle_entry_t *parent_entry = &handle_tbl(pool)[entry->parent_handle];
+        parent_entry->child_full_locked++;
+
         return MP_OK;
     }
 
@@ -1108,6 +1132,7 @@ mp_error_t mp_partial_map_fn(mp_applicant_t *app, mp_handle_t parent,
     child->child_type     = writable ? 1 : 0;
     child->child_refs     = 0;
     child->child_wr_refs  = 0;
+    child->child_full_locked = 0;
 
     /* Update parent bookkeeping */
     parent_entry->child_refs++;
@@ -1138,6 +1163,10 @@ mp_error_t mp_unlock_fn(mp_applicant_t *app, mp_handle_t handle, const char *fil
         if (entry->full_locked == 0)
             return MP_ERR_NOT_LOCKED;
         entry->full_locked--;
+
+        /* Update parent tracking */
+        mp_handle_entry_t *parent_entry = &handle_tbl(pool)[entry->parent_handle];
+        parent_entry->child_full_locked--;
 
         /* Writable child: vm_evict after unlock */
         if (entry->child_type == 1 && pool->vm_enabled && pool->vm_evict) {
@@ -1203,6 +1232,7 @@ mp_error_t mp_free_fn(mp_applicant_t *app, mp_handle_t handle, const char *file,
         parents[entry->parent_handle].child_refs--;
         if (entry->child_type == 1)
             parents[entry->parent_handle].child_wr_refs--;
+        parents[entry->parent_handle].child_full_locked -= entry->full_locked;
         goto free_handle;
     }
 
@@ -1281,6 +1311,7 @@ free_handle:
     entry->child_type    = 0;
     entry->child_refs    = 0;
     entry->child_wr_refs = 0;
+    entry->child_full_locked = 0;
     entry->start_vpn     = 0;
     entry->page_count    = 0;
     entry->prev          = 0xFFFF;
@@ -1735,14 +1766,20 @@ mp_error_t mp_compact_fn(mp_applicant_t *app, const char *file, int line) {
         }
 
         /* Locked page – skip block entirely, advance write cursor
-         * Also skip if owner has active children (child pointers rely
-         * on stable PPNs). */
+         * A page must not move when:
+         *   - lock_count > 0 (normal mp_lock outstanding)
+         *   - owner is a root handle with locked children
+         *   - owner is a child handle that is itself locked */
         if (pd[read_ppn].lock_count > 0 ||
-            ht[pd[read_ppn].owner_handle].child_refs > 0) {
+            (ht[pd[read_ppn].owner_handle].child_full_locked > 0) ||
+            (ht[pd[read_ppn].owner_handle].parent_handle != 0xFFFF &&
+             ht[pd[read_ppn].owner_handle].full_locked > 0)) {
             uint16_t block_start = read_ppn;
             while (read_ppn < tp && pd[read_ppn].flags == 1 &&
                    (pd[read_ppn].lock_count > 0 ||
-                    ht[pd[read_ppn].owner_handle].child_refs > 0))
+                    (ht[pd[read_ppn].owner_handle].child_full_locked > 0) ||
+                    (ht[pd[read_ppn].owner_handle].parent_handle != 0xFFFF &&
+                     ht[pd[read_ppn].owner_handle].full_locked > 0)))
                 read_ppn++;
             if (write_ppn < block_start)
                 write_ppn = block_start;

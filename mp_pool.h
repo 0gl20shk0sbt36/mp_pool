@@ -96,6 +96,7 @@ typedef struct {
     uint8_t  child_type;     /* (child only) 0=read-only, 1=writable */
     uint8_t  child_refs;     /* (root only) number of active child handles */
     uint8_t  child_wr_refs;  /* (root only) number of writable children */
+    uint16_t child_full_locked; /* (root only) sum of full_locked across children */
 } mp_handle_entry_t;
 
 /* Free-block linked-list node */
