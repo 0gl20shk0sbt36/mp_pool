@@ -604,6 +604,18 @@ static mp_error_t alloc_raw_pages(mp_pool_t *pool, uint16_t num_pages,
     return MP_OK;
 }
 
+/* ── Allocate + zero ─────────────────────────────────────────── */
+static mp_error_t alloc_raw_pages_zero(mp_pool_t *pool, uint16_t num_pages,
+                                       uint16_t *out_ppn,
+                                       const char *file, int line) {
+    mp_error_t err = alloc_raw_pages(pool, num_pages, out_ppn, file, line);
+    if (err != MP_OK) return err;
+    uint8_t *base = (uint8_t *)pool->pool_memory;
+    memset(base + (size_t)(*out_ppn) * pool->page_size, 0,
+           (size_t)num_pages * pool->page_size);
+    return MP_OK;
+}
+
 /* ── mp_alloc_pages ──────────────────────────────────────────── */
 mp_error_t mp_alloc_pages_fn(mp_applicant_t *app, uint16_t num_pages, mp_handle_t *out, const char *file, int line) {
     (void)file; (void)line;
@@ -1326,9 +1338,9 @@ mp_error_t mp_partial_map_write_only_fn(mp_applicant_t *app, mp_handle_t parent,
 
     mp_handle_entry_t *child = &handle_tbl(pool)[child_idx];
 
-    /* Allocate physical pages */
+    /* ── Allocate zeroed physical pages ── */
     uint16_t alloc_ppn;
-    mp_error_t ae = alloc_raw_pages(pool, num_pages, &alloc_ppn, file, line);
+    mp_error_t ae = alloc_raw_pages_zero(pool, num_pages, &alloc_ppn, file, line);
     if (ae != MP_OK) {
         bm_free(handle_bm(pool), child_idx);
         return ae;
@@ -1340,8 +1352,11 @@ mp_error_t mp_partial_map_write_only_fn(mp_applicant_t *app, mp_handle_t parent,
 
     uint16_t *p2v = ppn2vpn_tbl(pool);
     uint16_t parent_vpn = parent_entry->start_vpn;
+    uint8_t  *base      = (uint8_t *)pool->pool_memory;
+    size_t    ps        = pool->page_size;
+    size_t    end_off   = (offset + length) % ps;
 
-    /* Set up page mappings and copy data from parent */
+    /* Set up page mappings; copy non-user boundary regions from parent */
     for (uint16_t i = 0; i < num_pages; i++) {
         uint16_t ppn = (uint16_t)(alloc_ppn + i);
         v2p[(uint16_t)(child_vpn + i)] = ppn;
@@ -1350,28 +1365,18 @@ mp_error_t mp_partial_map_write_only_fn(mp_applicant_t *app, mp_handle_t parent,
         pd[ppn].lock_count   = 0;
         pd[ppn].owner_handle = child_idx;
 
-        /* Copy first/last page from parent; skip middle pages */
-        bool is_first = (i == 0);
-        bool is_last  = (i == num_pages - 1);
-        bool need_copy = false;
+        uint16_t parent_ppn = v2p[parent_vpn + parent_pg + i];
 
-        if (is_first && page_off > 0)
-            need_copy = true;       /* partial first page — need parent data */
-        else if (is_last && ((offset + length) % pool->page_size) != 0)
-            need_copy = true;       /* partial last page — need parent data */
-        else if (num_pages == 1 &&
-                 (page_off > 0 || (offset + length) % pool->page_size != 0))
-            need_copy = true;       /* single partial page — need parent data */
+        /* First page: copy bytes before user offset from parent */
+        if (i == 0 && page_off > 0 && parent_ppn != MP_PPN_INVALID)
+            memcpy(base + (size_t)ppn * ps,
+                   base + (size_t)parent_ppn * ps, page_off);
 
-        if (need_copy) {
-            uint16_t parent_ppn = v2p[parent_vpn + parent_pg + i];
-            if (parent_ppn != MP_PPN_INVALID) {
-                uint8_t *base = (uint8_t *)pool->pool_memory;
-                memcpy(base + (size_t)ppn * pool->page_size,
-                       base + (size_t)parent_ppn * pool->page_size,
-                       pool->page_size);
-            }
-        }
+        /* Last page: copy bytes after user region from parent */
+        if (i == num_pages - 1 && end_off > 0 && parent_ppn != MP_PPN_INVALID)
+            memcpy(base + (size_t)ppn * ps + end_off,
+                   base + (size_t)parent_ppn * ps + end_off,
+                   ps - end_off);
     }
 
     if (pool->vm_enabled)

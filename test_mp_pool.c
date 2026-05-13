@@ -1720,9 +1720,10 @@ static void test_T40_write_only(void) {
     e = mp_lock(&app, wo2, &ptr);
     check(e, MP_OK, "lock WO child (partial first page)");
     if (e == MP_OK) {
-        /* First page copied from parent (preserved 0xBB at page start) */
-        check_bool(((uint8_t*)ptr)[0] == 0xBB,
-                   "partial first page preserves parent data");
+        /* User region [50..150) is zeroed (not copied from parent) */
+        check_bool(*(uint8_t*)ptr == 0x00,
+                   "user region is zero (not parent data)");
+        /* Bytes before user offset preserved in parent (verify via parent page) */
         /* Write through child */
         memset(ptr, 0xCC, 100);
         assert(mp_unlock(&app, wo2) == MP_OK);
@@ -1756,6 +1757,45 @@ static void test_T40_write_only(void) {
     e = mp_partial_map_write_only(&app, parent, 0, PAGE_SIZE, &wo3);
     check(e, MP_ERR_WR_LOCKED, "WO rejected while WR exists");
     mp_free(&app, wr);
+
+    /* ── Multi-page WO: partial first and last pages ── */
+    /* Write new pattern to parent pages 0..3 */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    memset(pool_mem, 0xDD, PAGE_SIZE * 4);
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* 3-page WO starting at offset=50, length=PAGE_SIZE*2+100
+       → page_off=50, end_off=100, pages: [0..50) preserved, [50..end) zeroed */
+    mp_handle_t wo4;
+    e = mp_partial_map_write_only(&app, parent, 50, PAGE_SIZE * 2 + 100, &wo4);
+    check(e, MP_OK, "WO child 3 pages partial boundaries");
+
+    e = mp_lock(&app, wo4, &ptr);
+    check(e, MP_OK, "lock 3-page WO child");
+    if (e == MP_OK) {
+        /* Page 0: first 50 bytes preserved from parent */
+        check_bool(*(uint8_t*)ptr == 0x00,
+                   "page 0 user region zeroed (offset 0)");
+        /* Write unique patterns across all pages */
+        memset(ptr, 0x11, (size_t)PAGE_SIZE * 2 + 100);
+        assert(mp_unlock(&app, wo4) == MP_OK);
+    }
+    mp_free(&app, wo4);
+
+    /* Verify write-back */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    check_bool(((uint8_t*)pool_mem)[50] == 0x11,
+               "parent offset 50 = 0x11 (user data)");
+    check_bool(((uint8_t*)pool_mem)[PAGE_SIZE] == 0x11,
+               "parent page 1 = 0x11 (full user page)");
+    check_bool(((uint8_t*)pool_mem)[PAGE_SIZE*2 + 100] == 0x11,
+               "parent page 2 end offset = 0x11 (user data)");
+    check_bool(((uint8_t*)pool_mem)[PAGE_SIZE*2 + 200] == 0xDD,
+               "parent page 2 tail preserved (outside WO range)");
+    /* Verify bytes before offset preserved */
+    check_bool(*(uint8_t*)pool_mem == 0xDD,
+               "parent offset 0 preserved (before WO range)");
+    assert(mp_unlock(&app, parent) == MP_OK);
 
     mp_free(&app, parent);
 }
