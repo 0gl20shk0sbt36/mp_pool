@@ -1550,6 +1550,111 @@ static void test_T38_applicant_edge_cases(void) {
     check(e, MP_ERR_NULL_PTR, "mp_applicant_create_system(NULL) → NULL_PTR");
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ *  T39: RO child page sharing (no copy optimization)
+ * ═══════════════════════════════════════════════════════════════ */
+static void test_T39_ro_sharing(void) {
+    printf("\nT39: RO child page sharing (no copy)\n");
+    reset_pool();
+
+    /* Non-VM mode so RO children share parent pages */
+    mp_config_t cfg = {
+        .pool_memory  = pool_mem,
+        .pool_size    = POOL_SIZE,
+        .metadata     = meta_data,
+        .metadata_size= METADATA_SZ,
+        .page_size    = PAGE_SIZE,
+        .max_handles  = MAX_HANDLES,
+        .vm_enabled   = 0
+    };
+    mp_pool_t pool = {0};
+    assert(mp_init(&pool, &cfg) == MP_OK);
+    mp_applicant_t app = { .pool = &pool, .applicant_id = 128 };
+
+    mp_handle_t parent;
+    assert(mp_alloc_pages(&app, 4, &parent) == MP_OK);
+
+    /* Write pattern to parent, then unlock */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    memset(pool_mem, 0xAA, PAGE_SIZE * 4);
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* Create RO child that shares parent pages [page 1..2] */
+    mp_handle_t child;
+    mp_error_t e = mp_partial_map(&app, parent, PAGE_SIZE, PAGE_SIZE * 2, false, &child);
+    check(e, MP_OK, "RO child [1..2] created");
+
+    /* Lock child — should see parent's data (shared) */
+    void *ptr;
+    e = mp_lock(&app, child, &ptr);
+    check(e, MP_OK, "lock RO child");
+    if (e == MP_OK) {
+        /* Should see 0xAA from parent (shared, not zero) */
+        check_bool(*(uint8_t*)ptr == 0xAA,
+                   "data visible through shared RO child (0xAA, not zero)");
+        assert(mp_unlock(&app, child) == MP_OK);
+    }
+
+    /* Verify existing parent data visible at offset 50 in page 1 */
+    e = mp_lock(&app, child, &ptr);
+    if (e == MP_OK) {
+        check_bool(((uint8_t*)ptr)[50] == 0xAA,
+                   "existing parent data visible at offset 50");
+        assert(mp_unlock(&app, child) == MP_OK);
+    }
+
+    /* Free child — parent should still work */
+    mp_free(&app, child);
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    check_bool(*(uint8_t*)(pool_mem + PAGE_SIZE) == 0xAA,
+               "parent data intact after RO child freed");
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* ── Multiple RO children sharing same pages ── */
+    mp_handle_t c1, c2;
+    assert(mp_partial_map(&app, parent, PAGE_SIZE, PAGE_SIZE, false, &c1) == MP_OK);
+    assert(mp_partial_map(&app, parent, PAGE_SIZE, PAGE_SIZE, false, &c2) == MP_OK);
+
+    e = mp_lock(&app, c1, &ptr);
+    if (e == MP_OK) {
+        check_bool(*(uint8_t*)ptr == 0xAA,
+                   "c1 sees parent data (shared)");
+        assert(mp_unlock(&app, c1) == MP_OK);
+    }
+    e = mp_lock(&app, c2, &ptr);
+    if (e == MP_OK) {
+        check_bool(*(uint8_t*)ptr == 0xAA,
+                   "c2 sees parent data (shared)");
+        assert(mp_unlock(&app, c2) == MP_OK);
+    }
+    mp_free(&app, c1);
+    mp_free(&app, c2);
+
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    check_bool(*(uint8_t*)(pool_mem + PAGE_SIZE) == 0xAA,
+               "parent intact after multiple RO children freed");
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* ── Writable child still gets independent pages ── */
+    mp_handle_t wr_child;
+    assert(mp_partial_map(&app, parent, 0, PAGE_SIZE, true, &wr_child) == MP_OK);
+    e = mp_lock(&app, wr_child, &ptr);
+    if (e == MP_OK) {
+        check_bool(*(uint8_t*)ptr == 0x00,
+                   "writable child has own zero-initialized pages");
+        memset(ptr, 0xBB, PAGE_SIZE);
+        assert(mp_unlock(&app, wr_child) == MP_OK);
+    }
+    mp_free(&app, wr_child);
+
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    check_bool(*(uint8_t*)(pool_mem) == 0xAA,
+               "parent unaffected by writable child write");
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    mp_free(&app, parent);
+}
+
 int main(void) {
     printf("=== Memory Pool Test Suite ===\n");
 
@@ -1591,6 +1696,7 @@ int main(void) {
     test_T36_oom_callbacks();
     test_T37_init_already();
     test_T38_applicant_edge_cases();
+    test_T39_ro_sharing();
 
     printf("\n=== Results: %d passed, %d failed (out of %d) ===\n",
            test_passed, test_failed, test_idx);

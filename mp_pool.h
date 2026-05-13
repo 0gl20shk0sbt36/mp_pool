@@ -75,6 +75,7 @@ typedef struct {
     uint16_t flags;          /* 0=free, 1=allocated, 2=swapped */
     uint16_t lock_count;
     uint16_t owner_handle;   /* handle entry index owning this page */
+    uint16_t ro_share_refs;  /* number of RO children sharing this page */
 } mp_page_desc_t;
 
 #define MP_FULL_LOCK_MAX 200u  /* max concurrent full locks per handle */
@@ -153,6 +154,7 @@ typedef struct {
     size_t   page_size;
     uint16_t max_handles;
     uint8_t  vm_enabled;
+    uint8_t  swap_weight;          /* divisor for swap cost (0=default 2) */
     uint8_t  alloc_delayed;        /* 1 = lazy alloc (pages on first lock) */
     uint8_t  delayed_no_reserve;   /* 1 = don't reserve pages either (alloc_delayed must be 1) */
     mp_oom_callbacks_t oom_callbacks;
@@ -172,6 +174,7 @@ struct mp_pool_t {
     size_t     page_size;
     uint16_t   total_pages;
     uint8_t    vm_enabled;
+    uint8_t    swap_weight;
     uint8_t    alloc_delayed;
     uint8_t    delayed_no_reserve;
     mp_oom_callbacks_t oom_callbacks;
