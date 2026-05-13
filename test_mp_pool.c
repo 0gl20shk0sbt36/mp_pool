@@ -825,6 +825,48 @@ static void test_T14_partial_map(void) {
     e = mp_partial_map(&app, parent, 0, 0, false, &bad_child);
     check(e, MP_ERR_INVALID_PARAM, "partial_map with zero length");
 
+    /* ── Child handle rejection tests ── */
+    {
+        /* Create child for rejection tests */
+        mp_handle_t rej_child;
+        e = mp_partial_map(&app, parent, 0, PAGE_SIZE, false, &rej_child);
+        check(e, MP_OK, "create child for rejection tests");
+
+        /* mp_resize on child handle → WR_LOCKED */
+        e = mp_resize_pages(&app, &rej_child, 3);
+        check(e, MP_ERR_WR_LOCKED, "mp_resize_pages on child → WR_LOCKED");
+
+        e = mp_resize(&app, &rej_child, PAGE_SIZE * 3);
+        check(e, MP_ERR_WR_LOCKED, "mp_resize on child → WR_LOCKED");
+
+        mp_free(&app, rej_child);
+    }
+
+    /* ── mp_get_ptr on child handle includes page_offset ── */
+    {
+        mp_handle_t gptr_child;
+        e = mp_partial_map(&app, parent, 100, PAGE_SIZE, false, &gptr_child);
+        check(e, MP_OK, "create child for get_ptr test (offset=100)");
+
+        void *ptr;
+        e = mp_lock(&app, gptr_child, &ptr);
+        check(e, MP_OK, "lock child for get_ptr test");
+
+        /* mp_get_ptr should return same pointer as mp_lock */
+        void *gptr;
+        e = mp_get_ptr(&app, gptr_child, &gptr);
+        check(e, MP_OK, "mp_get_ptr on locked child");
+        check_bool(gptr == ptr, "mp_get_ptr matches mp_lock pointer");
+
+        /* Verify page_offset=100 is applied */
+        size_t off = (uint8_t *)gptr - (uint8_t *)pool_mem;
+        check_bool(off % PAGE_SIZE == 100,
+                   "mp_get_ptr includes page_offset=100");
+
+        assert(mp_unlock(&app, gptr_child) == MP_OK);
+        mp_free(&app, gptr_child);
+    }
+
     mp_free(&app, parent);
 }
 

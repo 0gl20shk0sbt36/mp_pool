@@ -1162,7 +1162,7 @@ mp_error_t mp_free_fn(mp_applicant_t *app, mp_handle_t handle, const char *file,
     /* If VM mode and pages are swapped out, we still need to find PPNs */
     if (first_ppn == MP_PPN_INVALID && pool->vm_enabled) {
         /* Pages were swapped out – just mark handle free and return */
-        goto free_handle;
+        goto update_parent;
     }
 
     /* Clear page descriptors and mappings */
@@ -1201,6 +1201,7 @@ mp_error_t mp_free_fn(mp_applicant_t *app, mp_handle_t handle, const char *file,
         fb_try_merge(pool, nidx);
     }
 
+update_parent:
     /* ── Update parent bookkeeping for child handles ── */
     if (entry->parent_handle != 0xFFFF) {
         mp_handle_entry_t *parents = handle_tbl(pool);
@@ -1384,6 +1385,10 @@ mp_error_t mp_resize_pages_fn(mp_applicant_t *app, mp_handle_t *handle,
     mp_error_t err;
     mp_handle_entry_t *entry = validate_handle(pool, *handle, &err);
     if (!entry) return err;
+
+    /* Child handles cannot be resized */
+    if (entry->parent_handle != 0xFFFF)
+        return MP_ERR_WR_LOCKED;
 
     uint16_t old_cnt = entry->page_count;
     if (new_num_pages == old_cnt) return MP_OK;
@@ -1848,7 +1853,7 @@ mp_error_t mp_get_ptr_fn(mp_applicant_t *app, mp_handle_t handle, void **out_ptr
     }
 
     *out_ptr = 
-    (uint8_t *)pool->pool_memory + (size_t)first_ppn * pool->page_size;
+    (uint8_t *)pool->pool_memory + (size_t)first_ppn * pool->page_size + entry->page_offset;
     return MP_OK;
 }
 
