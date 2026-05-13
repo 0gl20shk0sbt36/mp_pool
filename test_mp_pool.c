@@ -1655,6 +1655,111 @@ static void test_T39_ro_sharing(void) {
     mp_free(&app, parent);
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ *  T40: Write-only child (write-back on unlock)
+ * ═══════════════════════════════════════════════════════════════ */
+static void test_T40_write_only(void) {
+    printf("\nT40: Write-only child (write-back on unlock)\n");
+    reset_pool();
+
+    mp_config_t cfg = {
+        .pool_memory  = pool_mem,
+        .pool_size    = POOL_SIZE,
+        .metadata     = meta_data,
+        .metadata_size= METADATA_SZ,
+        .page_size    = PAGE_SIZE,
+        .max_handles  = MAX_HANDLES,
+        .vm_enabled   = 0
+    };
+    mp_pool_t pool = {0};
+    assert(mp_init(&pool, &cfg) == MP_OK);
+    mp_applicant_t app = { .pool = &pool, .applicant_id = 128 };
+
+    mp_handle_t parent;
+    assert(mp_alloc_pages(&app, 4, &parent) == MP_OK);
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    memset(pool_mem, 0xAA, PAGE_SIZE * 4);
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* ── Create WO child over full 2-page range (middle pages, no boundary copy) ── */
+    mp_handle_t wo;
+    mp_error_t e = mp_partial_map_write_only(&app, parent, PAGE_SIZE, PAGE_SIZE * 2, &wo);
+    check(e, MP_OK, "WO child [1..2] created");
+
+    /* Lock WO child, write data, unlock → data written back */
+    void *ptr;
+    e = mp_lock(&app, wo, &ptr);
+    check(e, MP_OK, "lock WO child");
+    if (e == MP_OK) {
+        /* Middle page (page 1): should be zeroed (no copy from parent) */
+        check_bool(*(uint8_t*)ptr == 0x00,
+                   "middle page is zero (no parent copy)");
+        /* Write through WO child */
+        memset(ptr, 0xBB, PAGE_SIZE * 2);
+        assert(mp_unlock(&app, wo) == MP_OK);
+    }
+
+    /* Free WO child before locking parent */
+    mp_free(&app, wo);
+
+    /* Data should be written back to parent */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    check_bool(*(uint8_t*)(pool_mem + PAGE_SIZE) == 0xBB,
+               "parent page 1 updated after WO unlock");
+    check_bool(*(uint8_t*)(pool_mem + PAGE_SIZE * 2) == 0xBB,
+               "parent page 2 updated after WO unlock");
+    check_bool(*(uint8_t*)(pool_mem) == 0xAA,
+               "parent page 0 unchanged (outside WO range)");
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* ── Partial first page (page_offset > 0) ── */
+    mp_handle_t wo2;
+    e = mp_partial_map_write_only(&app, parent, PAGE_SIZE + 50, 100, &wo2);
+    check(e, MP_OK, "WO child offset=50 len=100");
+
+    e = mp_lock(&app, wo2, &ptr);
+    check(e, MP_OK, "lock WO child (partial first page)");
+    if (e == MP_OK) {
+        /* First page copied from parent (preserved 0xBB at page start) */
+        check_bool(((uint8_t*)ptr)[0] == 0xBB,
+                   "partial first page preserves parent data");
+        /* Write through child */
+        memset(ptr, 0xCC, 100);
+        assert(mp_unlock(&app, wo2) == MP_OK);
+    }
+    mp_free(&app, wo2);
+
+    /* Verify write-back */
+    assert(mp_lock(&app, parent, NULL) == MP_OK);
+    check_bool(((uint8_t*)pool_mem)[PAGE_SIZE + 50] == 0xCC,
+               "parent updated at offset 50 after WO unlock");
+    check_bool(((uint8_t*)pool_mem)[PAGE_SIZE] == 0xBB,
+               "parent preserved at offset 0 (before WO range)");
+    assert(mp_unlock(&app, parent) == MP_OK);
+
+    /* ── Mutex: WO blocks RO, RO blocks WO ── */
+    mp_handle_t wo3;
+    e = mp_partial_map_write_only(&app, parent, 0, PAGE_SIZE, &wo3);
+    check(e, MP_OK, "WO child created");
+
+    /* RO should be rejected while WO exists */
+    mp_handle_t ro;
+    e = mp_partial_map(&app, parent, 0, PAGE_SIZE, false, &ro);
+    check(e, MP_ERR_WR_LOCKED, "RO rejected while WO exists");
+    mp_free(&app, wo3);
+
+    /* ── Mutex: WO blocks WR, WR blocks WO ── */
+    mp_handle_t wr;
+    e = mp_partial_map(&app, parent, 0, PAGE_SIZE, true, &wr);
+    check(e, MP_OK, "writable child created");
+
+    e = mp_partial_map_write_only(&app, parent, 0, PAGE_SIZE, &wo3);
+    check(e, MP_ERR_WR_LOCKED, "WO rejected while WR exists");
+    mp_free(&app, wr);
+
+    mp_free(&app, parent);
+}
+
 int main(void) {
     printf("=== Memory Pool Test Suite ===\n");
 
@@ -1697,6 +1802,7 @@ int main(void) {
     test_T37_init_already();
     test_T38_applicant_edge_cases();
     test_T39_ro_sharing();
+    test_T40_write_only();
 
     printf("\n=== Results: %d passed, %d failed (out of %d) ===\n",
            test_passed, test_failed, test_idx);

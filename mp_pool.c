@@ -1017,8 +1017,9 @@ mp_error_t mp_partial_map_fn(mp_applicant_t *app, mp_handle_t parent,
     /* Writable child → parent must have no children at all */
     if (writable && parent_entry->child_refs > 0)
         return MP_ERR_WR_LOCKED;
-    /* Read-only child → parent must have no writable children */
-    if (!writable && parent_entry->child_wr_refs > 0)
+    /* Read-only child → no writable or write-only children */
+    if (!writable && (parent_entry->child_wr_refs > 0 ||
+                      parent_entry->child_wo_refs > 0))
         return MP_ERR_WR_LOCKED;
 
     uint16_t num_pages = (uint16_t)((length + pool->page_size - 1) / pool->page_size);
@@ -1278,6 +1279,130 @@ alloc_copy:
     }
 }
 
+/* ── mp_partial_map_write_only_fn ────────────────────────────── */
+mp_error_t mp_partial_map_write_only_fn(mp_applicant_t *app, mp_handle_t parent,
+                                        size_t offset, size_t length,
+                                        mp_handle_t *out_child,
+                                        const char *file, int line) {
+    (void)file; (void)line;
+    if (!app) return MP_ERR_NULL_PTR;
+    mp_pool_t *pool = app->pool;
+    if (!pool) return MP_ERR_NULL_PTR;
+    if (pool->metadata == NULL) return MP_ERR_NULL_PTR;
+    mp_meta_header_t *mh = hdr(pool);
+    if (mh->magic != MP_MAGIC) return MP_ERR_INVALID_POOL;
+    if (!out_child) return MP_ERR_NULL_PTR;
+    if (length == 0) return MP_ERR_INVALID_PARAM;
+
+    mp_error_t err;
+    mp_handle_entry_t *parent_entry = validate_handle(pool, parent, &err);
+    if (!parent_entry) return err;
+
+    if (parent_entry->parent_handle != 0xFFFF)
+        return MP_ERR_INVALID_PARAM;
+
+    size_t total_bytes = (size_t)parent_entry->page_count * pool->page_size;
+    if (offset >= total_bytes) return MP_ERR_OUT_OF_RANGE;
+    if (offset + length > total_bytes)
+        length = total_bytes - offset;
+
+    /* Mutex: exclusive with all other children */
+    if (parent_entry->full_locked)
+        return MP_ERR_WR_LOCKED;
+    if (parent_entry->child_refs > 0)
+        return MP_ERR_WR_LOCKED;
+
+    uint16_t num_pages = (uint16_t)((length + pool->page_size - 1) / pool->page_size);
+    uint16_t page_off  = (uint16_t)(offset % pool->page_size);
+    uint16_t parent_pg = (uint16_t)(offset / pool->page_size);
+
+    uint16_t *v2p = vpn2ppn_tbl(pool);
+    mp_page_desc_t *pd = page_desc_tbl(pool);
+
+    /* Allocate handle entry */
+    uint16_t child_idx = bm_alloc(handle_bm(pool), mh->max_handles);
+    if (child_idx == 0xFFFF)
+        return MP_ERR_OUT_OF_HANDLES;
+
+    mp_handle_entry_t *child = &handle_tbl(pool)[child_idx];
+
+    /* Allocate physical pages */
+    uint16_t alloc_ppn;
+    mp_error_t ae = alloc_raw_pages(pool, num_pages, &alloc_ppn, file, line);
+    if (ae != MP_OK) {
+        bm_free(handle_bm(pool), child_idx);
+        return ae;
+    }
+
+    uint16_t child_vpn = alloc_ppn;
+    if (pool->vm_enabled)
+        child_vpn = alloc_ppn;
+
+    uint16_t *p2v = ppn2vpn_tbl(pool);
+    uint16_t parent_vpn = parent_entry->start_vpn;
+
+    /* Set up page mappings and copy data from parent */
+    for (uint16_t i = 0; i < num_pages; i++) {
+        uint16_t ppn = (uint16_t)(alloc_ppn + i);
+        v2p[(uint16_t)(child_vpn + i)] = ppn;
+        p2v[ppn] = (uint16_t)(child_vpn + i);
+        pd[ppn].flags        = 1;
+        pd[ppn].lock_count   = 0;
+        pd[ppn].owner_handle = child_idx;
+
+        /* Copy first/last page from parent; skip middle pages */
+        bool is_first = (i == 0);
+        bool is_last  = (i == num_pages - 1);
+        bool need_copy = false;
+
+        if (is_first && page_off > 0)
+            need_copy = true;       /* partial first page — need parent data */
+        else if (is_last && ((offset + length) % pool->page_size) != 0)
+            need_copy = true;       /* partial last page — need parent data */
+        else if (num_pages == 1 &&
+                 (page_off > 0 || (offset + length) % pool->page_size != 0))
+            need_copy = true;       /* single partial page — need parent data */
+
+        if (need_copy) {
+            uint16_t parent_ppn = v2p[parent_vpn + parent_pg + i];
+            if (parent_ppn != MP_PPN_INVALID) {
+                uint8_t *base = (uint8_t *)pool->pool_memory;
+                memcpy(base + (size_t)ppn * pool->page_size,
+                       base + (size_t)parent_ppn * pool->page_size,
+                       pool->page_size);
+            }
+        }
+    }
+
+    if (pool->vm_enabled)
+        lru_add_to_head(pool, child_idx);
+
+    child->generation++;
+    child->start_vpn      = child_vpn;
+    child->page_count     = num_pages;
+    child->last_access    = 0;
+    child->prev           = 0xFFFF;
+    child->next           = 0xFFFF;
+    child->applicant_id   = app->applicant_id;
+    child->allocated      = 1;
+    child->delayed        = 0;
+    child->full_locked    = 0;
+    child->parent_handle  = parent.index;
+    child->page_offset    = page_off;
+    child->parent_pg      = parent_pg;
+    child->child_type     = 2;       /* write-only */
+    child->child_refs     = 0;
+    child->child_wr_refs  = 0;
+    child->child_wo_refs  = 0;
+
+    parent_entry->child_refs++;
+    parent_entry->child_wo_refs++;
+
+    out_child->index      = child_idx;
+    out_child->generation = child->generation;
+    return MP_OK;
+}
+
 /* ── mp_unlock ─────────────────────────────────────────────────── */
 mp_error_t mp_unlock_fn(mp_applicant_t *app, mp_handle_t handle, const char *file, int line) {
     (void)file; (void)line;
@@ -1308,6 +1433,24 @@ mp_error_t mp_unlock_fn(mp_applicant_t *app, mp_handle_t handle, const char *fil
 
     if (entry->full_locked > 0)
         entry->full_locked--;
+
+    /* Write-only child: write-back all pages to parent */
+    if (entry->parent_handle != 0xFFFF && entry->child_type == 2 && any_unlocked) {
+        mp_handle_entry_t *parent_e = &handle_tbl(pool)[entry->parent_handle];
+        uint16_t pvpn = parent_e->start_vpn;
+        uint16_t ppg  = entry->parent_pg;
+        uint8_t *base = (uint8_t *)pool->pool_memory;
+
+        for (uint16_t i = 0; i < count; i++) {
+            uint16_t child_ppn  = v2p[vpn + i];
+            uint16_t parent_ppn = v2p[pvpn + ppg + i];
+            if (child_ppn != MP_PPN_INVALID && parent_ppn != MP_PPN_INVALID) {
+                memcpy(base + (size_t)parent_ppn * pool->page_size,
+                       base + (size_t)child_ppn  * pool->page_size,
+                       pool->page_size);
+            }
+        }
+    }
 
     /* Writable child: vm_evict after unlock */
     if (entry->parent_handle != 0xFFFF && entry->child_type == 1
@@ -1418,6 +1561,8 @@ update_parent:
         parents[entry->parent_handle].child_refs--;
         if (entry->child_type == 1)
             parents[entry->parent_handle].child_wr_refs--;
+        if (entry->child_type == 2)
+            parents[entry->parent_handle].child_wo_refs--;
     }
 
 free_handle:

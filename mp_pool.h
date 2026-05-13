@@ -94,9 +94,11 @@ typedef struct {
     uint8_t  full_locked;    /* mp_lock reference count (0 = none) */
     uint16_t parent_handle;  /* 0xFFFF = root, else index of parent handle */
     uint16_t page_offset;    /* intra-page byte offset (child handle only) */
-    uint8_t  child_type;     /* (child only) 0=read-only, 1=writable */
+    uint16_t parent_pg;      /* (child only) first parent-page this child covers */
+    uint8_t  child_type;     /* (child) 0=read-only, 1=writable, 2=write-only */
     uint8_t  child_refs;     /* (root only) number of active child handles */
-    uint8_t  child_wr_refs;  /* (root only) number of writable children */
+    uint8_t  child_wr_refs;  /* (root only) number of writable children  */
+    uint8_t  child_wo_refs;  /* (root only) number of write-only children */
 } mp_handle_entry_t;
 
 /* Free-block linked-list node */
@@ -213,6 +215,10 @@ mp_error_t mp_compact_fn      (mp_applicant_t *app, const char *file, int line);
 mp_error_t mp_partial_map_fn  (mp_applicant_t *app, mp_handle_t parent,
                                size_t offset, size_t length, bool writable,
                                mp_handle_t *out_child, const char *file, int line);
+mp_error_t mp_partial_map_write_only_fn(mp_applicant_t *app, mp_handle_t parent,
+                                        size_t offset, size_t length,
+                                        mp_handle_t *out_child,
+                                        const char *file, int line);
 
 /* ── Handle accessors ────────────────────────────────────────── */
 mp_error_t mp_get_size_fn      (mp_applicant_t *app, mp_handle_t handle,
@@ -241,6 +247,8 @@ mp_error_t mp_set_oom_callbacks_fn(mp_applicant_t *app,
 #  define mp_compact(app)                   mp_compact_fn(app, __FILE__, __LINE__)
 #  define mp_partial_map(app, parent, off, len, wr, child) \
         mp_partial_map_fn(app, parent, off, len, wr, child, __FILE__, __LINE__)
+#  define mp_partial_map_write_only(app, parent, off, len, child) \
+        mp_partial_map_write_only_fn(app, parent, off, len, child, __FILE__, __LINE__)
 #  define mp_get_size(app, h, sz)           mp_get_size_fn(app, h, sz, __FILE__, __LINE__)
 #  define mp_get_page_count(app, h, pc)     mp_get_page_count_fn(app, h, pc, __FILE__, __LINE__)
 #  define mp_get_ptr(app, h, ptr)           mp_get_ptr_fn(app, h, ptr, __FILE__, __LINE__)
@@ -258,6 +266,8 @@ mp_error_t mp_set_oom_callbacks_fn(mp_applicant_t *app,
 #  define mp_compact(app)                   mp_compact_fn(app, NULL, 0)
 #  define mp_partial_map(app, parent, off, len, wr, child) \
         mp_partial_map_fn(app, parent, off, len, wr, child, NULL, 0)
+#  define mp_partial_map_write_only(app, parent, off, len, child) \
+        mp_partial_map_write_only_fn(app, parent, off, len, child, NULL, 0)
 #  define mp_get_size(app, h, sz)           mp_get_size_fn(app, h, sz, NULL, 0)
 #  define mp_get_page_count(app, h, pc)     mp_get_page_count_fn(app, h, pc, NULL, 0)
 #  define mp_get_ptr(app, h, ptr)           mp_get_ptr_fn(app, h, ptr, NULL, 0)
