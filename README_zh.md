@@ -2,7 +2,17 @@
 
 **语言：中文** · [English Version](README_EN.md)
 
-一个轻量级的静态内存池库，采用 C99 标准编写，专为嵌入式系统和裸机环境设计。无操作系统调用，无动态分配——所有元数据和内存均由用户以固定静态数组提供。
+<div align="center">
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Language](https://img.shields.io/badge/language-C99-00599C.svg)
+![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-203%20passed-brightgreen.svg)
+![Platform](https://img.shields.io/badge/platform-embedded%20%7C%20bare--metal-lightgrey.svg)
+
+</div>
+
+一个轻量级的静态内存池库，采用 **C99 标准**编写，专为嵌入式系统和裸机环境设计。无操作系统调用，无动态分配——所有元数据和内存均由用户以固定静态数组提供。
 
 ---
 
@@ -450,4 +460,22 @@ mp_pool.o: mp_pool.c mp_pool.h
 
 ## 许可
 
-这是公有领域（public domain）软件，可自由使用和分发。
+采用 **MIT 许可证**。详情见 [LICENSE](LICENSE) 文件。
+
+**可商用**：允许在任何项目（包括商业项目）中使用、修改和分发本软件。
+**需声明原作者**：在软件或文档的所有副本中必须保留版权声明和许可声明。
+
+```
+MIT License
+
+Copyright (c) 2026 mp_pool contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the condition that the above copyright notice
+and this permission notice shall be included in all copies or substantial
+portions of the Software.
+```

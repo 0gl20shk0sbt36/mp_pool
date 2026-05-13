@@ -15,6 +15,7 @@ This document describes the internal architecture, data structures, algorithms, 
 - [VM Swap Mechanism](#vm-swap-mechanism)
 - [Error Handling Strategy](#error-handling-strategy)
 - [Testing](#testing)
+- [License](#license)
 - [Portability Notes](#portability-notes)
 
 ---
@@ -381,6 +382,14 @@ gcc -std=c99 -Wall -Wextra -pedantic -o test_mp_pool mp_pool.c test_mp_pool.c
 ```
 
 All 203 tests should pass with 0 failures.
+
+---
+
+## License
+
+Licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+
+**Commercial use** is permitted. **Attribution required** — the copyright notice and permission notice must be included in all copies or substantial portions of the Software.
 
 ---
 

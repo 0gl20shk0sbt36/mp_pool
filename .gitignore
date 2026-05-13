@@ -1,6 +1,33 @@
 # Build artifacts
 *.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.out
 test_mp_pool
+
+# Precompiled headers
+*.gch
+*.pch
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+!Makefile.*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
 
 # Agent working files
 .agents_tmp/
+
