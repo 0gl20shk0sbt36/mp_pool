@@ -267,9 +267,6 @@ static mp_handle_entry_t *validate_handle(const mp_pool_t *pool,
 static bool handle_all_pages_unlocked(const mp_pool_t *pool, uint16_t hidx) {
     mp_handle_entry_t *ht = handle_tbl(pool);
 
-    /* Handle with active children cannot be evicted */
-    if (ht[hidx].child_refs > 0) return false;
-
     uint16_t vpn   = ht[hidx].start_vpn;
     uint16_t count = ht[hidx].page_count;
 
