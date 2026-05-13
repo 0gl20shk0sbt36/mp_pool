@@ -104,6 +104,7 @@ typedef struct {
     uint16_t flags;          /* 0=空闲, 1=已分配, 2=已换出(VM) */
     uint16_t lock_count;     /* 引用计数；仅当为 0 时才可移动 */
     uint16_t owner_handle;   /* 拥有该页的句柄条目索引 */
+    uint16_t ro_share_refs;  /* 共享此页的只读子句柄数（>0 时禁止换出） */
 } mp_page_desc_t;
 ```
 
@@ -119,13 +120,17 @@ typedef struct {
     uint16_t last_access;   /* 时间戳/访问计数器（保留） */
     uint16_t prev;          /* LRU 链表前驱（0xFFFF = 无） */
     uint16_t next;          /* LRU 链表后继（0xFFFF = 无） */
+    uint16_t applicant_id;  /* 拥有此句柄的申请者 */
     uint8_t  allocated;       /* 0 = 空闲槽位, 1 = 使用中 */
     uint8_t  delayed;         /* 1 = 延迟分配（页尚未分配） */
     uint8_t  full_locked;     /* mp_lock 引用计数（0 = 无） */
     uint16_t parent_handle;   /* 0xFFFF = 根句柄，否则为父句柄索引 */
-    uint8_t  child_type;      /* （子句柄）0=只读, 1=可写 */
+    uint16_t page_offset;     /* （子句柄）页内字节偏移 */
+    uint16_t parent_pg;       /* （子句柄）子覆盖的首个父页 */
+    uint8_t  child_type;      /* （子句柄）0=只读, 1=可写, 2=只写 */
     uint8_t  child_refs;      /* （根句柄）活跃子句柄数 */
     uint8_t  child_wr_refs;   /* （根句柄）可写子句柄数 */
+    uint8_t  child_wo_refs;   /* （根句柄）只写子句柄数 */
 } mp_handle_entry_t;
 ```
 
@@ -268,26 +273,34 @@ LRU 链表的所有操作均为 O(1)：
 3. 更新 VPN→PPN、PPN→VPN 和页描述符。
 4. 将句柄移到 LRU 头部。
 
-### 子句柄（`mp_partial_map`）
+### 子句柄（`mp_partial_map` / `mp_partial_map_write_only`）
 
-`mp_partial_map` 创建一个**子句柄**，映射父句柄分配页的子范围（仅 VM 模式）。子句柄是轻量级记录（创建时无页 I/O），具有以下特性：
+子句柄映射父句柄分配页的子范围。三种类型：
 
-- 可通过 `mp_lock` / `mp_unlock` 加锁/解锁。
-- **永远不会被换出**（它们共享父句柄的物理页）。
-- 拥有自己的锁定引用计数（`full_locked`）。
-- 对于**可写**子句柄，`mp_unlock` 会触发 `vm_evict`（写回）。
-- `mp_free(child)` 仅释放子映射；父页面保留分配。
+| 类型 | `child_type` | 页所有权 | 写回 | 互斥 |
+|------|-------------|---------|------|------|
+| 只读（RO） | 0 | 共享父页（`ro_share_refs++`），无拷贝 | 无 | 不与 WR/WO 共存 |
+| 可写（WR） | 1 | 独立页面（alloc+copy 全部父数据） | `vm_evict`（VM 模式） | 独占（无其他子句柄） |
+| 只写（WO） | 2 | 独立页面（alloc+zero），首尾非用户区从父拷贝 | 解锁时写通 | 独占（无其他子句柄） |
 
-**三路互斥**（在父句柄上实施）：
-| 活跃状态                | 完整 `mp_lock` | `mp_partial_map`（只读） | `mp_partial_map`（可写） |
-|------------------------|----------------|-------------------------|-------------------------|
-| `full_locked > 0`      | 允许           | 阻止                    | 阻止                    |
-| `child_refs > 0`       | 阻止           | 允许（只读）            | 阻止（可写）            |
-| `child_wr_refs > 0`    | 阻止           | 阻止                    | 阻止                    |
+**非 VM 模式**：
+- 只读子句柄直接共享父页的 PPN，`ro_share_refs` 递增，VPN→PPN 映射指向父页。
+- 可写/只写子句柄分配独立页面。
 
-- `child_refs` = 活跃子句柄总数，`child_wr_refs` = 可写子句柄子集。
-- 多个只读子句柄可共存（`child_refs` 递增，`child_wr_refs` 不变）。
-- 同时最多一个可写子句柄（`child_refs` 和 `child_wr_refs` 均递增）。
+**VM 模式**：
+- 只读/可写均触发 alloc+copy（与旧版行为一致）。
+
+**互斥规则**（在父句柄上实施）：
+| 活跃状态 | 完整 `mp_lock` | 只读子句柄 | 可写子句柄 | 只写子句柄 |
+|---------|---------------|-----------|-----------|-----------|
+| `full_locked > 0` | 允许 | 阻止 | 阻止 | 阻止 |
+| `child_refs > 0`（有子句柄） | 阻止 | 允许（RO） | 阻止 | 阻止 |
+| `child_wr_refs > 0`（有可写） | 阻止 | 阻止 | 阻止 | 阻止 |
+| `child_wo_refs > 0`（有只写） | 阻止 | 阻止 | 阻止 | 阻止 |
+
+- 只读子句柄可共存（多个 RO 共享同一父页范围时共用 `ro_share_refs`）。
+- 可写/只写子句柄各自独占；只写与所有类型互斥。
+- `mp_free` 对只读子句柄递减 `ro_share_refs` 不释放页；对可写/只写释放页。
 
 ---
 
@@ -352,7 +365,13 @@ LRU 链表的所有操作均为 O(1)：
 | T31 | 延迟无预留 | 超卖正常工作 |
 | T32 | 释放申请者 | 非强制释放所有句柄 |
 | T33 | 强制释放申请者 | 强制释放已锁定句柄 |
-| T34 |  互斥 | 完整锁 / 只读子句柄 / 可写子句柄三路互斥 |
+| T34 | 子句柄互斥 | 完整锁 / 只读 / 可写 三路互斥 |
+| T35 | 子句柄压缩 | 未锁定的子句柄不阻碍压缩 |
+| T36 | OOM 回调 | 内存不足回调触发 |
+| T37 | 重复初始化 | 第二次 `mp_init` 返回 `ALREADY_INIT` |
+| T38 | 申请者边界 | ID 范围验证 |
+| T39 | 只读页共享 | RO 子句柄直接共享父页（无拷贝） |
+| T40 | 只写子句柄 | 分配+清零、首尾保留、解锁写通、互斥 |
 
 ### 构建和运行
 
@@ -361,7 +380,7 @@ gcc -std=c99 -Wall -Wextra -pedantic -o test_mp_pool mp_pool.c test_mp_pool.c
 ./test_mp_pool
 ```
 
-所有 96 个测试应通过，0 失败。
+所有 203 个测试应通过，0 失败。
 
 ---
 

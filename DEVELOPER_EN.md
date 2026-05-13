@@ -104,6 +104,7 @@ typedef struct {
     uint16_t flags;          /* 0=free, 1=allocated, 2=swapped (VM) */
     uint16_t lock_count;     /* Reference count; page can be moved only when 0 */
     uint16_t owner_handle;   /* Handle entry index that owns this page */
+    uint16_t ro_share_refs;  /* Number of RO children sharing this page (>0 prevents eviction) */
 } mp_page_desc_t;
 ```
 
@@ -119,10 +120,17 @@ typedef struct {
     uint16_t last_access;   /* Timestamp / access counter (reserved) */
     uint16_t prev;          /* LRU linked list prev (0xFFFF = none) */
     uint16_t next;          /* LRU linked list next (0xFFFF = none) */
+    uint16_t applicant_id;  /* Which applicant owns this handle */
     uint8_t  allocated;     /* 0 = free slot, 1 = in use */
     uint8_t  delayed;       /* 1 = lazy allocation (pages not yet assigned) */
-    uint8_t  wr_locked;     /* 1 = writable partial lock active */
-    uint8_t  rd_locks;      /* count of active read-only partial locks */
+    uint8_t  full_locked;   /* mp_lock reference count (0 = none) */
+    uint16_t parent_handle; /* 0xFFFF = root, else index of parent handle */
+    uint16_t page_offset;   /* (child only) intra-page byte offset */
+    uint16_t parent_pg;     /* (child only) first parent-page this child covers */
+    uint8_t  child_type;    /* (child) 0=read-only, 1=writable, 2=write-only */
+    uint8_t  child_refs;    /* (root) number of active child handles */
+    uint8_t  child_wr_refs; /* (root) number of writable children */
+    uint8_t  child_wo_refs; /* (root) number of write-only children */
 } mp_handle_entry_t;
 ```
 
@@ -265,27 +273,34 @@ When `mp_lock` encounters a page with PPN == `MP_PPN_INVALID` (swapped out):
 3. Update VPN→PPN, PPN→VPN, and page descriptor.
 4. Move the handle to the LRU head.
 
-### Child Handle (`mp_partial_map`)
+### Child Handles (`mp_partial_map` / `mp_partial_map_write_only`)
 
-`mp_partial_map` creates a **child handle** that maps a sub-range of a parent handle's allocated
-pages (VM mode only). Child handles are light-weight records (no page-I/O at creation time) that:
+Child handles map a sub-range of a parent handle's pages. Three types:
 
-- Can be locked/unlocked via `mp_lock` / `mp_unlock`.
-- Are **never swapped out** (they share the parent's physical pages).
-- Have their own lock reference count (`full_locked`).
-- For a **writable** child, `mp_unlock` triggers `vm_evict` (write‑back).
-- `mp_free(child)` unmaps the child mapping only; parent pages remain allocated.
+| Type | `child_type` | Page ownership | Write-back | Mutex |
+|------|-------------|----------------|------------|-------|
+| Read-only (RO) | 0 | Shares parent pages (`ro_share_refs++`), no copy | None | Cannot coexist with WR/WO |
+| Writable (WR) | 1 | Independent pages (alloc+copy all parent data) | `vm_evict` (VM mode) | Exclusive (no other children) |
+| Write-only (WO) | 2 | Independent pages (alloc+zero), boundary bytes from parent | Write-through on unlock | Exclusive (no other children) |
 
-**Three‑way mutual exclusion** (enforced on the parent handle):
-| Active State               | Full `mp_lock` | `mp_partial_map` (rd) | `mp_partial_map` (wr) |
-|----------------------------|----------------|-----------------------|-----------------------|
-| `full_locked > 0`          | Allowed        | Blocked               | Blocked               |
-| `child_refs > 0`           | Blocked        | Allowed (rd)          | Blocked (wr)          |
-| `child_wr_refs > 0`        | Blocked        | Blocked               | Blocked               |
+**Non-VM mode**:
+- Read-only children map directly to parent PPNs, incrementing `ro_share_refs`.
+- Writable / write-only children allocate independent pages.
 
-- `child_refs` = total active child handles, `child_wr_refs` = writable children subset.
-- Multiple read‑only children may coexist (`child_refs` increments, `child_wr_refs` unchanged).
-- Only one writable child exists at a time (both `child_refs` and `child_wr_refs` increment).
+**VM mode**:
+- Both read-only and writable trigger alloc+copy (same as legacy behaviour).
+
+**Mutual exclusion** (enforced on the parent handle):
+| Active state | Full `mp_lock` | Read-only child | Writable child | Write-only child |
+|-------------|---------------|----------------|---------------|----------------|
+| `full_locked > 0` | allowed | blocked | blocked | blocked |
+| `child_refs > 0` (any child) | blocked | allowed (RO) | blocked | blocked |
+| `child_wr_refs > 0` (writable) | blocked | blocked | blocked | blocked |
+| `child_wo_refs > 0` (write-only) | blocked | blocked | blocked | blocked |
+
+- Read-only children may coexist (multiple RO sharing the same parent pages share `ro_share_refs`).
+- Writable / write-only children are each exclusive; write-only is exclusive with all types.
+- `mp_free` for RO children decrements `ro_share_refs` without freeing pages; for WR/WO it frees pages.
 
 ---
 
@@ -351,6 +366,12 @@ The test file `test_mp_pool.c` covers 27 test scenarios (T1–T27) with 96 indiv
 | T32 | Free applicant | Non-force free of all handles |
 | T33 | Free applicant force | Force-free of a locked handle |
 | T34 | `mp_partial_map` mutex | Full lock / child rd / child wr three‑way exclusion |
+| T35 | Child compact unlocked | Unlocked children don't block compaction |
+| T36 | OOM callbacks | Out-of-memory callbacks fire correctly |
+| T37 | Init already | Second `mp_init` returns `ALREADY_INIT` |
+| T38 | Applicant edge cases | ID range validation |
+| T39 | RO page sharing | RO child shares parent pages (no copy) |
+| T40 | Write-only child | Zeroed pages, boundary preserve, write-through, mutex |
 
 ### Building and Running
 
@@ -359,7 +380,7 @@ gcc -std=c99 -Wall -Wextra -pedantic -o test_mp_pool mp_pool.c test_mp_pool.c
 ./test_mp_pool
 ```
 
-All 96 tests should pass with 0 failures.
+All 203 tests should pass with 0 failures.
 
 ---
 

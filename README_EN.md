@@ -11,6 +11,14 @@ A lightweight, static memory pool library written in C99 for embedded systems an
 - [Features](#features)
 - [Quick Start](#quick-start)
 - [API Reference](#api-reference)
+  - [mp_init](#mp_error_t-mp_init)
+  - [mp_alloc / mp_alloc_pages](#mp_error_t-mp_alloc)
+  - [mp_lock / mp_unlock](#mp_error_t-mp_lock)
+  - [mp_partial_map](#mp_error_t-mp_partial_map)
+  - [mp_partial_map_write_only](#mp_error_t-mp_partial_map_write_only)
+  - [mp_free](#mp_error_t-mp_free)
+  - [mp_resize / mp_resize_pages](#mp_error_t-mp_resize)
+  - [mp_compact](#mp_error_t-mp_compact)
 - [Configuration](#configuration)
 - [Error Codes](#error-codes)
 - [VM Mode (Optional)](#vm-mode-optional)
@@ -162,28 +170,56 @@ Lock a handle's pages and get a pointer to the memory.
 
 ### `mp_error_t mp_partial_map(mp_pool_t *pool, mp_handle_t parent, size_t offset, size_t length, bool writable, mp_handle_t *out_child)`
 
-Create a **child handle** that maps a sub-range of a parent handle's pages (VM mode only).
+Create a **child handle** that maps a sub-range of a parent handle's pages.
 
 | Parameter | Description |
 |-----------|-------------|
 | `pool` | Memory pool |
-| `parent` | The parent handle to create a child from |
+| `parent` | The parent handle |
 | `offset` | Byte offset from the start of the parent allocation |
 | `length` | Number of bytes (must be ≥ 1) |
-| `writable` | `true` = writable child, `false` = read-only child |
+| `writable` | `true` = writable child (independent copy), `false` = read-only child (shared pages) |
 | `out_child` | Output: the newly created child handle |
 
-- **Three‑way mutual exclusion** (enforced on the parent handle):
-  - A full `mp_lock` on the parent prevents any `mp_partial_map`.
-  - A writable child prevents both other children and a full `mp_lock` on the parent.
-  - A read-only child prevents writable children and a full `mp_lock`, but multiple read‑only children may coexist.
-- Returns `MP_ERR_VM_NOT_ENABLED` if VM mode is off.
-- Returns `MP_ERR_OUT_OF_RANGE` if `offset + length` exceeds the parent allocation.
-- Returns `MP_ERR_INVALID_PARAM` if `length == 0`.
-- Returns `MP_ERR_WR_LOCKED` if a conflicting lock is active.
-- The child handle can be locked/unlocked with `mp_lock` / `mp_unlock`.
-- `mp_unlock(child)` for a writable child triggers `vm_evict` (write‑back).
-- `mp_free(child)` releases the child mapping only; parent pages remain allocated.
+**Non-VM mode**:
+- Read-only children share the parent's pages directly (no data copy). `ro_share_refs` is incremented on each shared page.
+- Writable children allocate independent pages and copy all parent data.
+
+**VM mode**:
+- Same behaviour as legacy: both read-only and writable trigger alloc+copy.
+
+**Mutual exclusion**:
+| Active state | Full `mp_lock` | Read-only child | Writable child |
+|-------------|---------------|----------------|---------------|
+| `full_locked > 0` | allowed | blocked | blocked |
+| `child_refs > 0` (any child exists) | blocked | allowed (RO) | blocked |
+| `child_wr_refs > 0` (writable child exists) | blocked | blocked | blocked |
+
+- Read-only children may coexist; writable children are exclusive.
+- Child handles can be locked/unlocked with `mp_lock` / `mp_unlock`.
+- `mp_free(child)` for read-only children only decrements `ro_share_refs` (does not free pages); for writable children it frees pages.
+
+---
+
+### `mp_error_t mp_partial_map_write_only(mp_pool_t *pool, mp_handle_t parent, size_t offset, size_t length, mp_handle_t *out_child)`
+
+Create a **write-only child handle** that allocates independent pages and automatically writes them back to the parent on unlock.
+
+| Parameter | Description |
+|-----------|-------------|
+| `pool` | Memory pool |
+| `parent` | The parent handle |
+| `offset` | Byte offset from the start of the parent allocation |
+| `length` | Number of bytes (must be ≥ 1) |
+| `out_child` | Output: the newly created child handle |
+
+- Allocates independent pages (all zeroed), **only** copies non-user boundary bytes from parent:
+  - First page: bytes before `page_off` are preserved from parent.
+  - Last page: bytes after `end_off` are preserved from parent.
+  - User range + middle pages: zeroed (no parent read needed).
+- **On unlock**: all child pages are automatically written back to the parent (write-through semantics).
+- **Mutual exclusion**: exclusive with ALL other child types (read-only, writable, other write-only).
+- Freeing releases child pages and decrements `child_wo_refs`.
 
 ---
 
@@ -195,21 +231,24 @@ Unlock a handle's pages (decrement lock count).
 |-----------|-------------|
 | `handle` | The handle to unlock |
 
-- For a **writable child handle**, after decrementing locks, triggers `vm_evict` (write‑back to external storage).
+- For a **writable child** (`child_type = 1`), after decrementing locks, triggers `vm_evict` (write‑back to external storage).
+- For a **write-only child** (`child_type = 2`), after decrementing locks, automatically writes all child pages back to the parent (write-through).
 - Returns `MP_ERR_NOT_LOCKED` only if **no** page of this handle was locked at all.
 
 ---
 
 ### `mp_error_t mp_free(mp_pool_t *pool, mp_handle_t handle)`
 
-Release a handle and return its pages to the free pool.
+Release a handle.
 
 | Parameter | Description |
 |-----------|-------------|
 | `handle` | The handle to free |
 
 - Increments the handle's generation, invalidating any copies of the old handle value.
-- The freed pages are inserted into the free-block linked list and automatically **merged** with any adjacent free blocks.
+- **Read-only children** (shared pages): decrements `ro_share_refs` on each page; does **not** free physical pages. Parent pages remain valid.
+- **Writable / write-only children** (independent pages): frees all child pages to the free pool, automatically **merged** with adjacent free blocks.
+- **Root handles**: frees all pages, updates parent's `child_refs` / `child_wr_refs` / `child_wo_refs`.
 - In VM mode, the handle is removed from the LRU list.
 
 ---
@@ -276,6 +315,7 @@ Defragment the pool by moving unlocked allocated pages toward PPN 0.
 | `vm_user_data` | `void *` | Opaque pointer passed to VM callbacks (may be NULL) |
 | `vm_evict` | callback | Called when a page range is swapped out |
 | `vm_load` | callback | Called when a page range is loaded back |
+| `swap_weight` | `uint8_t` | Swap cost weight (default 2), used in overlap cost calculation |
 
 ### `MP_METADATA_SIZE(total_pages, max_handles)` macro
 
@@ -315,7 +355,7 @@ The macro accounts for:
 | `MP_ERR_ALREADY_INIT` | 11 | Attempted to re-initialise an already-initialised pool |
 | `MP_ERR_NO_VICTIM` | 12 | VM mode: all handles have at least one locked page, none can be evicted |
 | `MP_ERR_FREE_NODE_EXHAUSTED` | 13 | Free-block node pool exhausted (fragmentation too high) |
-| `MP_ERR_WR_LOCKED` | 14 | A lock conflict occurred (full lock vs. child handle / child rd vs. child wr) |
+| `MP_ERR_WR_LOCKED` | 14 | A lock conflict occurred (full lock / read-only / writable / write-only child exclusion) |
 | `MP_ERR_APPLICANT_ID_INVALID` | 15 | Applicant ID is invalid |
 
 ---

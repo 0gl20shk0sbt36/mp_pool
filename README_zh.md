@@ -11,6 +11,14 @@
 - [特性](#特性)
 - [快速入门](#快速入门)
 - [API 参考](#api-参考)
+  - [mp_init](#mp_error_t-mp_init)
+  - [mp_alloc / mp_alloc_pages](#mp_error_t-mp_alloc)
+  - [mp_lock / mp_unlock](#mp_error_t-mp_lock)
+  - [mp_partial_map](#mp_error_t-mp_partial_map)
+  - [mp_partial_map_write_only](#mp_error_t-mp_partial_map_write_only)
+  - [mp_free](#mp_error_t-mp_free)
+  - [mp_resize / mp_resize_pages](#mp_error_t-mp_resize)
+  - [mp_compact](#mp_error_t-mp_compact)
 - [配置](#配置)
 - [错误码](#错误码)
 - [VM 模式（可选）](#vm-模式可选)
@@ -162,7 +170,7 @@ mp_alloc(&my_pool, 1000, &h);    /* 内部向上取整到 4 页（1024 字节）
 
 ### `mp_error_t mp_partial_map(mp_pool_t *pool, mp_handle_t parent, size_t offset, size_t length, bool writable, mp_handle_t *out_child)`
 
-创建一个**子句柄**，映射父句柄部分页的子范围（仅 VM 模式）。
+创建一个**子句柄**，映射父句柄部分页的子范围。
 
 | 参数 | 说明 |
 |------|------|
@@ -170,20 +178,48 @@ mp_alloc(&my_pool, 1000, &h);    /* 内部向上取整到 4 页（1024 字节）
 | `parent` | 父句柄 |
 | `offset` | 相对于父分配起始地址的字节偏移 |
 | `length` | 字节数（必须 ≥ 1） |
-| `writable` | `true` = 可写子句柄，`false` = 只读子句柄 |
+| `writable` | `true` = 可写子句柄（独立拷贝），`false` = 只读子句柄（共享页） |
 | `out_child` | 输出：新创建的子句柄 |
 
-- **三路互斥**（在父句柄上实施）：
-  - 父句柄上的完整 `mp_lock` 阻止任何 `mp_partial_map`。
-  - 可写子句柄阻止其他子句柄和父句柄的完整 `mp_lock`。
-  - 只读子句柄阻止可写子句柄和完整 `mp_lock`，但多个只读子句柄可共存。
-- 若 VM 模式未启用，返回 `MP_ERR_VM_NOT_ENABLED`。
-- 若 `offset + length` 超出父分配范围，返回 `MP_ERR_OUT_OF_RANGE`。
-- 若 `length == 0`，返回 `MP_ERR_INVALID_PARAM`。
-- 若存在冲突锁，返回 `MP_ERR_WR_LOCKED`。
+**非 VM 模式**：
+- 只读子句柄直接共享父页（不拷贝数据），`ro_share_refs` 递增。
+- 可写子句柄分配独立页面，拷贝全部父数据。
+
+**VM 模式**：
+- 行为同旧版：只读/可写均触发 alloc+copy。
+
+**互斥规则**：
+| 活跃状态 | 完整 `mp_lock` | 只读子句柄 | 可写子句柄 |
+|----------|---------------|-----------|-----------|
+| `full_locked > 0` | 允许 | 阻止 | 阻止 |
+| `child_refs > 0`（有子句柄） | 阻止 | 允许（只读） | 阻止 |
+| `child_wr_refs > 0`（有可写子句柄） | 阻止 | 阻止 | 阻止 |
+
+- 只读子句柄可共存；可写子句柄独占。
 - 子句柄可通过 `mp_lock` / `mp_unlock` 加锁/解锁。
-- `mp_unlock(child)` 对于可写子句柄会触发 `vm_evict`（写回）。
-- `mp_free(child)` 仅释放子映射；父页面保留分配。
+- `mp_free(child)` 对只读子句柄仅递减 `ro_share_refs`（不释放页）；对可写子句柄释放页。
+
+---
+
+### `mp_error_t mp_partial_map_write_only(mp_pool_t *pool, mp_handle_t parent, size_t offset, size_t length, mp_handle_t *out_child)`
+
+创建一个**只写（write-only）子句柄**，分配独立页面，解锁时自动写回父页。
+
+| 参数 | 说明 |
+|------|------|
+| `pool` | 内存池 |
+| `parent` | 父句柄 |
+| `offset` | 相对于父分配起始地址的字节偏移 |
+| `length` | 字节数（必须 ≥ 1） |
+| `out_child` | 输出：新创建的子句柄 |
+
+- 分配独立页面（全部清零），**仅**从父页拷贝首尾页的非用户区域。
+  - 首页：偏移前的字节从父页保留。
+  - 末页：结束后的字节从父页保留。
+  - 用户范围 + 中间页：全零（无需从父读取）。
+- **解锁时**：所有子页自动写回父页（写通语义）。
+- **互斥**：与所有其他子句柄互斥（只读、可写、其他只写）。
+- 释放时释放子页，递减 `child_wo_refs`。
 
 ---
 
@@ -195,21 +231,24 @@ mp_alloc(&my_pool, 1000, &h);    /* 内部向上取整到 4 页（1024 字节）
 |------|------|
 | `handle` | 要解锁的句柄 |
 
-- 对于**可写子句柄**，递减锁定后触发 `vm_evict`（写回外部存储）。
+- 对于**可写子句柄**（`child_type = 1`），递减锁定后触发 `vm_evict`（写回外部存储）。
+- 对于**只写子句柄**（`child_type = 2`），递减锁定后自动将全部子页写回父页（写通）。
 - 仅当**没有任何**页被锁定时才返回 `MP_ERR_NOT_LOCKED`。
 
 ---
 
 ### `mp_error_t mp_free(mp_pool_t *pool, mp_handle_t handle)`
 
-释放句柄并将其页面归还到空闲池。
+释放句柄。
 
 | 参数 | 说明 |
 |------|------|
 | `handle` | 要释放的句柄 |
 
 - 递增句柄的 generation，使所有旧句柄值失效。
-- 释放的页面插入空闲块链表，并自动与相邻空闲块**合并**。
+- **只读子句柄**（共享页）：递减各页的 `ro_share_refs`，**不释放**物理页。父页继续有效。
+- **可写/只写子句柄**（独立页）：释放所有子页到空闲池，自动与相邻空闲块**合并**。
+- **根句柄**：释放所有页，更新父句柄的 `child_refs` / `child_wr_refs` / `child_wo_refs`。
 - 在 VM 模式下，将句柄从 LRU 链表中移除。
 
 ---
@@ -276,6 +315,7 @@ mp_alloc(&my_pool, 1000, &h);    /* 内部向上取整到 4 页（1024 字节）
 | `vm_user_data` | `void *` | 传递给 VM 回调的不透明指针（可为 NULL） |
 | `vm_evict` | 回调 | 页面范围被换出时调用 |
 | `vm_load` | 回调 | 页面范围被换入时调用 |
+| `swap_weight` | `uint8_t` | 换出代价权重（默认 2），用于重叠检测中计算换出代价 |
 
 ### `MP_METADATA_SIZE(total_pages, max_handles)` 宏
 
@@ -315,7 +355,7 @@ static uint8_t metadata[MP_METADATA_SIZE(64, 16)];
 | `MP_ERR_ALREADY_INIT` | 11 | 尝试重复初始化已初始化的池 |
 | `MP_ERR_NO_VICTIM` | 12 | VM 模式：所有句柄至少有一页被锁定，无法换出 |
 | `MP_ERR_FREE_NODE_EXHAUSTED` | 13 | 空闲块节点池耗尽（碎片化程度过高） |
-| `MP_ERR_WR_LOCKED` | 14 | 锁冲突（完整锁与子句柄 / 只读子句柄与可写子句柄） |
+| `MP_ERR_WR_LOCKED` | 14 | 锁冲突（完整锁/只读/可写/只写子句柄互斥） |
 | `MP_ERR_APPLICANT_ID_INVALID` | 15 | 申请者 ID 无效 |
 
 ---
