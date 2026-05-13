@@ -645,7 +645,6 @@ mp_error_t mp_alloc_pages_fn(mp_applicant_t *app, uint16_t num_pages, mp_handle_
         ht[hidx].child_type    = 0;
         ht[hidx].child_refs    = 0;
         ht[hidx].child_wr_refs = 0;
-        ht[hidx].child_full_locked = 0;
 
         if (!pool->delayed_no_reserve)
             mh->reserved_pages += num_pages;
@@ -712,7 +711,6 @@ mp_error_t mp_alloc_pages_fn(mp_applicant_t *app, uint16_t num_pages, mp_handle_
     ht[hidx].child_type    = 0;
     ht[hidx].child_refs    = 0;
     ht[hidx].child_wr_refs = 0;
-    ht[hidx].child_full_locked = 0;
 
     /* Add to LRU head if VM enabled */
     if (pool->vm_enabled)
@@ -1071,7 +1069,6 @@ mp_error_t mp_partial_map_fn(mp_applicant_t *app, mp_handle_t parent,
     child->child_type     = writable ? 1 : 0;
     child->child_refs     = 0;
     child->child_wr_refs  = 0;
-    child->child_full_locked = 0;
 
     /* Update parent bookkeeping */
     parent_entry->child_refs++;
@@ -1227,7 +1224,6 @@ free_handle:
     entry->child_type    = 0;
     entry->child_refs    = 0;
     entry->child_wr_refs = 0;
-    entry->child_full_locked = 0;
     entry->start_vpn     = 0;
     entry->page_count    = 0;
     entry->prev          = 0xFFFF;

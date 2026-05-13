@@ -868,7 +868,7 @@ static void test_T35_child_compact_unlocked(void) {
     memset(ptr, 0x22, PAGE_SIZE);
     assert(mp_unlock(&app, c2) == MP_OK);
 
-    /* child_refs > 0, but child_full_locked == 0 → compaction allowed */
+    /* child_refs > 0, but children are unlocked → compaction allowed */
     mp_error_t e = mp_compact(&app);
     check(e, MP_OK, "compact returns OK");
 
