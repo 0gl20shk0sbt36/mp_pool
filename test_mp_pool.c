@@ -1403,6 +1403,153 @@ static void test_T34_partial_map_mutex(void) {
 
     mp_free(&app, h);
 }
+/* ═══════════════════════════════════════════════════════════════
+ *  T36: OOM callbacks
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int oom_fired_simple = 0;
+static int oom_fired_info   = 0;
+static void *oom_last_user_data  = NULL;
+static mp_error_t oom_last_error = MP_OK;
+
+static void oom_cb_simple(void *user_data, const char *file, int line) {
+    (void)file; (void)line;
+    oom_fired_simple++;
+    oom_last_user_data = user_data;
+}
+
+static void oom_cb_info(void *user_data, mp_error_t error,
+                        const char *file, int line) {
+    (void)file; (void)line;
+    oom_fired_info++;
+    oom_last_user_data = user_data;
+    oom_last_error = error;
+}
+
+static void reset_oom_counters(void) {
+    oom_fired_simple = 0;
+    oom_fired_info   = 0;
+    oom_last_user_data  = NULL;
+    oom_last_error      = MP_OK;
+}
+
+static void test_T36_oom_callbacks(void) {
+    printf("\nT36: OOM callbacks\n");
+    reset_pool();
+    reset_oom_counters();
+
+    /* Use max_handles=2 so we exhaust handles quickly */
+    mp_config_t cfg = { .pool_memory = pool_mem, .pool_size = POOL_SIZE,
+        .metadata = meta_data, .metadata_size = METADATA_SZ,
+        .page_size = PAGE_SIZE, .max_handles = 2 };
+    mp_pool_t pool = {0};
+    assert(mp_init(&pool, &cfg) == MP_OK);
+    mp_applicant_t app = { .pool = &pool, .applicant_id = 1 };
+    (void)app;
+
+    /* Set OOM callbacks */
+    mp_oom_callbacks_t cb = {
+        .on_out_of_handles = { .user_data = (void *)0x42, .fn = oom_cb_simple },
+        .on_oom            = { .user_data = (void *)0x99,
+                               .fn = (mp_oom_info_fn)oom_cb_info },
+    };
+    mp_error_t e = mp_set_oom_callbacks(&app, &cb);
+    check(e, MP_OK, "mp_set_oom_callbacks returns OK");
+
+    /* Exhaust handles to trigger out-of-handles */
+    mp_handle_t ha, hb;
+    assert(mp_alloc_pages(&app, 2, &ha) == MP_OK);
+    assert(mp_alloc_pages(&app, 2, &hb) == MP_OK);
+    /* With max_handles=2, only 2 slots exist — third must fail */
+    mp_handle_t hc;
+    e = mp_alloc_pages(&app, 2, &hc);
+    check(e, MP_ERR_OUT_OF_HANDLES, "alloc fails (out of handles)");
+
+    /* Both callbacks should have fired */
+    check_bool(oom_fired_info > 0, "on_oom info callback fired");
+    check_bool(oom_fired_simple > 0, "on_out_of_handles callback fired");
+    check_bool(oom_last_user_data == (void *)0x42,
+               "on_out_of_handles user_data passed correctly");
+
+    /* Clear callbacks with NULL */
+    e = mp_set_oom_callbacks(&app, NULL);
+    check(e, MP_OK, "clear OOM callbacks with NULL");
+
+    reset_oom_counters();
+    e = mp_alloc_pages(&app, 2, &hc);
+    check(e, MP_ERR_OUT_OF_HANDLES, "alloc still fails after clear");
+    check_bool(oom_fired_info   == 0, "on_oom not fired after clear");
+    check_bool(oom_fired_simple == 0, "on_out_of_handles not fired after clear");
+
+    /* NULL-pointer safety */
+    e = mp_set_oom_callbacks(NULL, &cb);
+    check(e, MP_ERR_NULL_PTR, "mp_set_oom_callbacks(NULL) → NULL_PTR");
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  T37: mp_init already initialized
+ * ═══════════════════════════════════════════════════════════════ */
+static void test_T37_init_already(void) {
+    printf("\nT37: mp_init already initialized\n");
+    reset_pool();
+
+    mp_config_t cfg = { .pool_memory = pool_mem, .pool_size = POOL_SIZE,
+        .metadata = meta_data, .metadata_size = METADATA_SZ,
+        .page_size = PAGE_SIZE, .max_handles = MAX_HANDLES };
+    mp_pool_t pool = {0};
+    assert(mp_init(&pool, &cfg) == MP_OK);
+
+    /* Second init on same pool struct should fail */
+    mp_error_t e = mp_init(&pool, &cfg);
+    check(e, MP_ERR_ALREADY_INIT, "second mp_init returns ALREADY_INIT");
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  T38: applicant edge cases
+ * ═══════════════════════════════════════════════════════════════ */
+static void test_T38_applicant_edge_cases(void) {
+    printf("\nT38: applicant edge cases\n");
+    reset_pool();
+    mp_config_t cfg = { .pool_memory = pool_mem, .pool_size = POOL_SIZE,
+        .metadata = meta_data, .metadata_size = METADATA_SZ,
+        .page_size = PAGE_SIZE, .max_handles = MAX_HANDLES };
+    mp_pool_t pool = {0};
+    assert(mp_init(&pool, &cfg) == MP_OK);
+
+    /* System ID 0 is valid */
+    mp_applicant_t sys;
+    mp_error_t e = mp_applicant_create_system(&pool, &sys, 0);
+    check(e, MP_OK, "system ID 0 accepted");
+    check_bool(sys.applicant_id == 0, "system ID = 0");
+
+    /* System ID 127 is valid (upper boundary) */
+    mp_applicant_t sys2;
+    e = mp_applicant_create_system(&pool, &sys2, 127);
+    check(e, MP_OK, "system ID 127 accepted");
+    check_bool(sys2.applicant_id == 127, "system ID = 127");
+
+    /* System ID 128 is invalid (lower boundary of user range) */
+    mp_applicant_t sys3;
+    e = mp_applicant_create_system(&pool, &sys3, 128);
+    check(e, MP_ERR_APPLICANT_ID_INVALID, "system ID 128 rejected");
+
+    /* System ID > 127 is invalid */
+    e = mp_applicant_create_system(&pool, &sys3, 200);
+    check(e, MP_ERR_APPLICANT_ID_INVALID, "system ID 200 rejected");
+
+    /* User applicant ID auto-increments above system IDs */
+    mp_applicant_t user1;
+    e = mp_applicant_create(&pool, &user1);
+    check(e, MP_OK, "user applicant after system IDs");
+    check_bool(user1.applicant_id >= 128, "user ID >= 128");
+
+    /* NULL pool pointer checks */
+    e = mp_applicant_create(NULL, &user1);
+    check(e, MP_ERR_NULL_PTR, "mp_applicant_create(NULL) → NULL_PTR");
+    e = mp_applicant_create_system(NULL, &sys, 42);
+    check(e, MP_ERR_NULL_PTR, "mp_applicant_create_system(NULL) → NULL_PTR");
+}
+
 int main(void) {
     printf("=== Memory Pool Test Suite ===\n");
 
@@ -1441,6 +1588,9 @@ int main(void) {
     test_T33_applicant_free_force();
     test_T34_partial_map_mutex();
     test_T35_child_compact_unlocked();
+    test_T36_oom_callbacks();
+    test_T37_init_already();
+    test_T38_applicant_edge_cases();
 
     printf("\n=== Results: %d passed, %d failed (out of %d) ===\n",
            test_passed, test_failed, test_idx);
