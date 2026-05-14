@@ -165,6 +165,8 @@ typedef struct {
                        uint16_t num_pages, void *src, size_t len);
     void   (*vm_load)(void *user_data, uint16_t start_vpn,
                       uint16_t num_pages, void *dst, size_t len);
+    void   (*vm_clear)(void *user_data, uint16_t start_vpn,
+                       uint16_t num_pages, size_t len);
 } mp_config_t;
 
 /* ── Memory pool structure (user-allocated) ──────────────────── */
@@ -183,6 +185,7 @@ struct mp_pool_t {
     void      *vm_user_data;
     void     (*vm_evict)(void *, uint16_t, uint16_t, void *, size_t);
     void     (*vm_load)(void *, uint16_t, uint16_t, void *, size_t);
+    void     (*vm_clear)(void *, uint16_t, uint16_t, size_t);
 };
 
 /* ── Applicant lifecycle ─────────────────────────────────────── */

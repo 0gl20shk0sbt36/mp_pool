@@ -349,6 +349,7 @@ mp_error_t mp_init_fn(mp_pool_t *pool, const mp_config_t *cfg, const char *file,
     pool->vm_user_data       = cfg->vm_user_data;
     pool->vm_evict     = cfg->vm_evict;
     pool->vm_load      = cfg->vm_load;
+    pool->vm_clear     = cfg->vm_clear;
 
     /* ── Clear metadata ── */
     memset(cfg->metadata, 0, cfg->metadata_size);
@@ -1519,7 +1520,10 @@ mp_error_t mp_free_fn(mp_applicant_t *app, mp_handle_t handle, const char *file,
 
     /* If VM mode and pages are swapped out, we still need to find PPNs */
     if (first_ppn == MP_PPN_INVALID && pool->vm_enabled) {
-        /* Pages were swapped out – just mark handle free and return */
+        /* Pages were swapped out – clear from backing store, free handle */
+        if (pool->vm_clear)
+            pool->vm_clear(pool->vm_user_data, vpn, count,
+                           (size_t)count * pool->page_size);
         goto update_parent;
     }
 
